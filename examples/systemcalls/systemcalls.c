@@ -1,4 +1,8 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -9,15 +13,14 @@
 */
 bool do_system(const char *cmd)
 {
-
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
-
-    return true;
+    if(system(cmd) == 0)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 
 /**
@@ -39,7 +42,9 @@ bool do_exec(int count, ...)
     va_list args;
     va_start(args, count);
     char * command[count+1];
-    int i;
+    int i, status;
+    pid_t pid;
+    
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -58,10 +63,49 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
-
-    va_end(args);
-
-    return true;
+    fflush(stdout); //Flush for printf
+    
+    pid = fork();    
+    if(pid == -1)
+    {
+        //Fork failed
+        va_end(args);
+        return false;
+    }
+    else if(pid == 0)
+    {
+        //Child process
+        if(execv(command[0], command) == -1)
+        {
+            //Should never return.  execv call failed
+            perror("execv error");
+            exit(-1);
+        }
+            
+    }
+    else
+    {
+        //In the parent
+        va_end(args); //done with these
+        
+        if(waitpid(pid, &status, 0) == -1)
+        {
+            return false;
+        }
+        else if (WIFEXITED(status)
+                 && (WEXITSTATUS(status) == 0) )
+        {
+            //Successful, normal child exit from execv above
+            return true;
+        }   
+        else
+        {
+            return false;
+        }
+    }
+    
+    //Should never get here
+    return false;
 }
 
 /**
@@ -74,7 +118,9 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_list args;
     va_start(args, count);
     char * command[count+1];
-    int i;
+    int i, status, fd;
+    pid_t pid;
+    
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -93,7 +139,67 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *
 */
 
-    va_end(args);
-
-    return true;
+    fflush(stdout); //Flush for printf
+    
+    fd = open(outputfile, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+    if(fd == -1)
+    {
+        //Open failed
+        va_end(args);
+        return false;
+    }
+    
+    pid = fork();    
+    if(pid == -1)
+    {
+        //Fork failed
+        close(fd);
+        va_end(args);
+        return false;
+    }
+    else if(pid == 0)
+    {
+        //Child process
+        if(dup2(fd, 1) == -1)
+        {
+            //dup2 failed
+            close(fd);
+            va_end(args);
+            return false;
+        }
+        
+        close(fd);
+        
+        if(execv(command[0], command) == -1)
+        {
+            //Should never return.  execv call failed
+            perror("execv error");
+            exit(-1);
+        }
+            
+    }
+    else
+    {
+        //In the parent
+        va_end(args); //done with these
+        close(fd);
+        
+        if(waitpid(pid, &status, 0) == -1)
+        {
+            return false;
+        }
+        else if (WIFEXITED(status)
+                 && (WEXITSTATUS(status) == 0) )
+        {
+            //Successful, normal child exit from execv above
+            return true;
+        }   
+        else
+        {
+            return false;
+        }
+    }
+    
+    //Should never get here
+    return false;
 }
