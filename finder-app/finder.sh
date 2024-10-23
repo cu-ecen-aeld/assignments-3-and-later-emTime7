@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 
 #Requirements are to check aruments
