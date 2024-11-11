@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <arpa/inet.h>
+#include <pthread.h>
+#include <time.h>
 
 
 #define DATA_SIZE    1024
@@ -19,6 +21,33 @@ int file_descriptor, socket_number, accepted_socket_number = -1;
 struct addrinfo *result;
 char *buf_ptr;
 bool caught_signal = false;
+pthread_mutex_t mutex;
+
+void cleanup_memory(void)
+{
+   closelog();
+   close(file_descriptor);
+   close(accepted_socket_number);
+   close(socket_number);
+   freeaddrinfo(result);
+   free(buf_ptr);
+}
+
+static void protected_write_to_file(char *buf, int number_of_bytes)
+{
+   if(number_of_bytes > 0)
+   {   
+      (void)pthread_mutex_lock(&mutex);
+      if(write(file_descriptor, buf, number_of_bytes) == -1)
+      {
+         (void)pthread_mutex_unlock(&mutex);
+         syslog(LOG_DEBUG, "File Write failed");
+         cleanup_memory();
+         exit(-1);
+      }
+      (void)pthread_mutex_unlock(&mutex);
+   }
+}
 
 static void signal_handler(int signal_number)
 {
@@ -29,14 +58,21 @@ static void signal_handler(int signal_number)
    } 
 }
 
-void cleanup_memory(void)
+static void signal_handler_timer(int signal_number)
 {
-   closelog();
-   close(file_descriptor);
-   close(accepted_socket_number);
-   close(socket_number);
-   freeaddrinfo(result);
-   free(buf_ptr);
+   char outstring[200];
+   time_t t;
+   struct tm *temp;
+   int length_of_time;
+   
+   if(signal_number == SIGRTMIN)
+   {
+      //10 second timer expired
+      t = time(NULL);
+      temp = localtime(&t);
+      length_of_time = strftime(outstring, sizeof(outstring), "timestamp:%a, %d %b %Y %T %z\n", temp);
+      protected_write_to_file(outstring, length_of_time);
+   } 
 }
 
 void *get_in_addr(struct sockaddr *sa)
@@ -63,11 +99,19 @@ int main (int argc, char *argv[])
    unsigned int number_of_blocks = 0, number_of_bytes = 0;
    pid_t pid;
    int one_value = 1;
+   timer_t timer;
+   struct sigevent evp;
+   struct itimerspec ts;
    
    memset(&new_action, 0, sizeof(struct sigaction));
    new_action.sa_handler = signal_handler;
    if(   (sigaction(SIGTERM, &new_action, NULL) != 0)
       || (sigaction(SIGINT, &new_action, NULL) != 0))
+   {
+      return(-1);
+   }
+   new_action.sa_handler = signal_handler_timer;
+   if(sigaction(SIGRTMIN, &new_action, NULL) != 0)
    {
       return(-1);
    }
@@ -87,6 +131,9 @@ int main (int argc, char *argv[])
       cleanup_memory();
       return(-1);
    }
+   
+   pthread_mutex_init(&mutex, NULL);
+   
    
    getaddrinfo(NULL, "9000", &addinfo, &result);
    socket_number = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
@@ -118,7 +165,28 @@ int main (int argc, char *argv[])
       }
    }
    
-   do
+   //Setup timer
+   evp.sigev_value.sival_ptr = &timer;
+   evp.sigev_notify = SIGEV_SIGNAL;
+   evp.sigev_signo = SIGRTMIN;
+   if(timer_create(CLOCK_REALTIME, &evp, &timer) != 0)
+   {
+      syslog(LOG_ERR, "Could not create timer");
+      cleanup_memory();
+      return(-1);
+   }
+   ts.it_interval.tv_sec = 10;
+   ts.it_interval.tv_nsec = 0;
+   ts.it_value.tv_sec = 10;
+   ts.it_value.tv_nsec = 0;
+   if(timer_settime(timer, 0, &ts, NULL) != 0)
+   {
+      syslog(LOG_ERR, "Could not set timer");
+      cleanup_memory();
+      return(-1);
+   }
+   
+   do //Big loop - accept, recv, write to file, read back out in chunks, send contents back, and close
    {
       receiving_done = false;
       sending_done = false;
@@ -179,16 +247,8 @@ int main (int argc, char *argv[])
       }
       
       //Write to all to file
-      if(number_of_bytes > 0)
-      {   
-         if(write(file_descriptor, &buf_ptr[0], number_of_bytes) == -1)
-         {
-            syslog(LOG_DEBUG, "File Write failed");
-            cleanup_memory();
-            return(-1);
-         }
-      }
-         
+      protected_write_to_file(&buf_ptr[0], number_of_bytes);
+               
       //Send everything back.  Need to reset back to start of file
       fsync(file_descriptor);
       lseek(file_descriptor, 0, SEEK_SET);
