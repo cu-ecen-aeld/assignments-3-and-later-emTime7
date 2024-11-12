@@ -13,24 +13,34 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <time.h>
+#include "queue.h"
 
+struct thread_data
+{
+   pthread_t pthread_id;
+   bool thread_complete_success;
+   int accepted_fd;
+   char accepted_ipstr[INET6_ADDRSTRLEN];
+};
+
+typedef struct slist_data_s slist_data_t;
+struct slist_data_s
+{
+   struct thread_data thread_data_variable;
+   SLIST_ENTRY(slist_data_s) entries;
+};
 
 #define DATA_SIZE    1024
 
-int file_descriptor, socket_number, accepted_socket_number = -1;
+int file_descriptor, socket_number = -1;
 struct addrinfo *result;
-char *buf_ptr;
 bool caught_signal = false;
 pthread_mutex_t mutex;
+struct sockaddr_storage their_address;
 
-void cleanup_memory(void)
+void cleanup_log(void)
 {
    closelog();
-   close(file_descriptor);
-   close(accepted_socket_number);
-   close(socket_number);
-   freeaddrinfo(result);
-   free(buf_ptr);
 }
 
 static void protected_write_to_file(char *buf, int number_of_bytes)
@@ -42,7 +52,7 @@ static void protected_write_to_file(char *buf, int number_of_bytes)
       {
          (void)pthread_mutex_unlock(&mutex);
          syslog(LOG_DEBUG, "File Write failed");
-         cleanup_memory();
+         cleanup_log();
          exit(-1);
       }
       (void)pthread_mutex_unlock(&mutex);
@@ -87,21 +97,113 @@ void *get_in_addr(struct sockaddr *sa)
    }
 }
 
+void* threadfunc(void* thread_param)
+{
+   bool receiving_done, sending_done = false;
+   unsigned int number_of_blocks = 0, number_of_bytes = 0;
+   int number_of_bytes_received, number_of_bytes_from_file = -1;
+   char *buf_ptr;
+   
+   struct thread_data* thread_func_args = (struct thread_data *) thread_param;
+   
+   syslog(LOG_DEBUG, "Accepted connection from %s\n", thread_func_args->accepted_ipstr);
+      
+   buf_ptr = calloc(DATA_SIZE, 1);
+   if(buf_ptr == NULL)
+   {
+      syslog(LOG_ERR, "Could not allocate buf_ptr storage");
+      thread_func_args->thread_complete_success = false;
+      return(0);
+   }
+   number_of_blocks = 1;
+   number_of_bytes = 0;
+      
+   do
+   {
+      receiving_done = false;
+      sending_done = false;
+      number_of_bytes_received = recv(thread_func_args->accepted_fd, &buf_ptr[number_of_bytes], DATA_SIZE, 0);
+      
+      if(number_of_bytes_received <= 0)
+      {   
+         receiving_done = true;
+      }
+      else
+      {
+         number_of_bytes += number_of_bytes_received;
+         number_of_blocks++;
+         buf_ptr = realloc(buf_ptr, (DATA_SIZE * number_of_blocks));
+         if(buf_ptr == NULL)
+         {
+            syslog(LOG_ERR, "Could not re-allocate buf_ptr storage");
+            thread_func_args->thread_complete_success = false;
+            return(0);
+         }
+      }
+         
+      //If we receive a newline we are done.
+      if(strchr(buf_ptr, '\n') > 0)
+      {
+         receiving_done = true;
+      }
+
+   }while(   (receiving_done == false) 
+          && (caught_signal == false));
+ 
+   if(caught_signal == true)
+   {
+      syslog(LOG_DEBUG, "Caught signal, exiting");
+      remove("/var/tmp/aesdsocketdata");
+      //cleanup_log();
+      free(buf_ptr);
+      thread_func_args->thread_complete_success = false;
+      return(0);
+   }
+      
+   //Write to all to file
+   protected_write_to_file(&buf_ptr[0], number_of_bytes);
+               
+   //Send everything back.  Need to reset back to start of file
+   fsync(file_descriptor);
+   lseek(file_descriptor, 0, SEEK_SET);
+      
+   do
+   {
+      number_of_bytes_from_file = read(file_descriptor, &buf_ptr[0], DATA_SIZE);
+      if(number_of_bytes_from_file > 0)
+      {
+         send(thread_func_args->accepted_fd, &buf_ptr[0], number_of_bytes_from_file, 0);
+      }
+      else
+      {
+         sending_done = true;
+      }
+         
+
+   }while(   (sending_done == false) 
+          && (caught_signal == false));
+         
+   close(thread_func_args->accepted_fd);
+   syslog(LOG_DEBUG, "Closed connection from %s", thread_func_args->accepted_ipstr);
+   free(buf_ptr);
+   thread_func_args->thread_complete_success = true;
+      
+   return(thread_param);
+}
+
 int main (int argc, char *argv[])
 {
    struct sigaction new_action;
    struct addrinfo addinfo;
    socklen_t address_size;
-   struct sockaddr_storage their_address;
-   int number_of_bytes_received, number_of_bytes_from_file = -1;
+   int accepted_socket_number = -1;
    char ipstr[INET6_ADDRSTRLEN];
-   bool receiving_done, sending_done = false;
-   unsigned int number_of_blocks = 0, number_of_bytes = 0;
    pid_t pid;
    int one_value = 1;
    timer_t timer;
    struct sigevent evp;
    struct itimerspec ts;
+   slist_data_t *datap = NULL, *datap_temp = NULL;
    
    memset(&new_action, 0, sizeof(struct sigaction));
    new_action.sa_handler = signal_handler;
@@ -128,19 +230,21 @@ int main (int argc, char *argv[])
    if(file_descriptor == -1)
    {
       syslog(LOG_ERR, "Could not open file /var/tmp/aesdsocketdata");
-      cleanup_memory();
+      cleanup_log();
       return(-1);
    }
    
    pthread_mutex_init(&mutex, NULL);
-   
+   SLIST_HEAD(slisthead, slist_data_s) head;
+   SLIST_INIT(&head);
    
    getaddrinfo(NULL, "9000", &addinfo, &result);
    socket_number = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
    setsockopt(socket_number, SOL_SOCKET, SO_REUSEADDR, &one_value, sizeof(one_value));
    bind(socket_number, result->ai_addr, result->ai_addrlen);
    listen(socket_number, 10);
-  
+   freeaddrinfo(result); 
+   
    //if specified, run as daemon
    if((argc > 1) && (strcmp(argv[1], "-d") == 0))
    {
@@ -150,7 +254,7 @@ int main (int argc, char *argv[])
       {
          //Fork failed
          syslog(LOG_ERR, "fork() failed");
-         cleanup_memory();
+         cleanup_log();
          return(-1);
       }
       else if(pid == 0)
@@ -160,7 +264,7 @@ int main (int argc, char *argv[])
       else
       {
          //In the parent
-         cleanup_memory();    
+         cleanup_log();    
          return(0);
       }
    }
@@ -172,7 +276,7 @@ int main (int argc, char *argv[])
    if(timer_create(CLOCK_REALTIME, &evp, &timer) != 0)
    {
       syslog(LOG_ERR, "Could not create timer");
-      cleanup_memory();
+      cleanup_log();
       return(-1);
    }
    ts.it_interval.tv_sec = 10;
@@ -182,98 +286,48 @@ int main (int argc, char *argv[])
    if(timer_settime(timer, 0, &ts, NULL) != 0)
    {
       syslog(LOG_ERR, "Could not set timer");
-      cleanup_memory();
+      cleanup_log();
       return(-1);
    }
    
    do //Big loop - accept, recv, write to file, read back out in chunks, send contents back, and close
    {
-      receiving_done = false;
-      sending_done = false;
       address_size = sizeof(their_address);
       accepted_socket_number = accept(socket_number, (struct sockaddr *)&their_address, &address_size);
       
       inet_ntop(their_address.ss_family, get_in_addr((struct sockaddr *)&their_address), ipstr, sizeof(ipstr));
 
-      syslog(LOG_DEBUG, "Accepted connection from %s\n", ipstr);
+      //Create thread and node
+      datap = malloc(sizeof(slist_data_t));
+      datap->thread_data_variable.thread_complete_success = false;
+      datap->thread_data_variable.accepted_fd = accepted_socket_number;
+      strcpy(datap->thread_data_variable.accepted_ipstr, ipstr);
       
-      buf_ptr = calloc(DATA_SIZE, 1);
-      if(buf_ptr == NULL)
+      SLIST_INSERT_HEAD(&head, datap, entries);
+     
+      if(pthread_create((&datap->thread_data_variable.pthread_id), NULL, threadfunc, (void *)&(datap->thread_data_variable)) != 0)
       {
-         syslog(LOG_ERR, "Could not allocate buf_ptr storage");
-         cleanup_memory();
+         syslog(LOG_DEBUG, "Could not create thread, exiting");
+         free(datap);
+         cleanup_log();
          return(-1);
       }
-      number_of_blocks = 1;
-      number_of_bytes = 0;
       
-      do
+      //Check for thread cleanup
+      SLIST_FOREACH_SAFE(datap, &head, entries, datap_temp)
       {
-
-         number_of_bytes_received = recv(accepted_socket_number, &buf_ptr[number_of_bytes], DATA_SIZE, 0);
-      
-         if(number_of_bytes_received <= 0)
-         {   
-            receiving_done = true;
-         }
-         else
+         if(datap->thread_data_variable.thread_complete_success == true)
          {
-            number_of_bytes += number_of_bytes_received;
-            number_of_blocks++;
-            buf_ptr = realloc(buf_ptr, (DATA_SIZE * number_of_blocks));
-            if(buf_ptr == NULL)
-            {
-               syslog(LOG_ERR, "Could not re-allocate buf_ptr storage");
-               cleanup_memory();
-               return(-1);
-            }
-         }
-         
-         //If we receive a newline we are done.
-         if(strchr(buf_ptr, '\n') > 0)
-         {
-            receiving_done = true;
-         }
-
-      }while(   (receiving_done == false) 
-             && (caught_signal == false));
- 
-      if(caught_signal == true)
-      {
-         syslog(LOG_DEBUG, "Caught signal, exiting");
-         remove("/var/tmp/aesdsocketdata");
-         cleanup_memory();
-         return(0);
+            pthread_join(datap->thread_data_variable.pthread_id, NULL);
+            SLIST_REMOVE(&head, datap, slist_data_s, entries);
+            free(datap);
+         }      
       }
-      
-      //Write to all to file
-      protected_write_to_file(&buf_ptr[0], number_of_bytes);
-               
-      //Send everything back.  Need to reset back to start of file
-      fsync(file_descriptor);
-      lseek(file_descriptor, 0, SEEK_SET);
-      
-      do
-      {
-         number_of_bytes_from_file = read(file_descriptor, &buf_ptr[0], DATA_SIZE);
-         if(number_of_bytes_from_file > 0)
-         {
-            send(accepted_socket_number, &buf_ptr[0], number_of_bytes_from_file, 0);
-         }
-         else
-         {
-            sending_done = true;
-         }
-         
-
-      }while(   (sending_done == false) 
-             && (caught_signal == false));
-         
-      close(accepted_socket_number);
-      syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
-      free(buf_ptr);
    
    } while(caught_signal == false);
+   
+   close(file_descriptor);
+   close(socket_number);
    
    if(caught_signal == true)
    {
@@ -281,7 +335,19 @@ int main (int argc, char *argv[])
       remove("/var/tmp/aesdsocketdata");
    }
    
-   cleanup_memory();
+   cleanup_log();
+   
+   //Check for thread cleanup in case we were terminated early
+   SLIST_FOREACH_SAFE(datap, &head, entries, datap_temp)
+   {
+      if(datap->thread_data_variable.thread_complete_success == true)
+      {
+         pthread_join(datap->thread_data_variable.pthread_id, NULL);
+         SLIST_REMOVE(&head, datap, slist_data_s, entries);
+         free(datap);
+      }      
+   }
+      
    return(0);
    
 }
