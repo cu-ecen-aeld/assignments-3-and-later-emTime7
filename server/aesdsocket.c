@@ -80,7 +80,7 @@ static void signal_handler_timer(int signal_number)
       //10 second timer expired
       t = time(NULL);
       temp = localtime(&t);
-      length_of_time = strftime(outstring, sizeof(outstring), "timestamp:%a, %d %b %Y %T %z\n", temp);
+      length_of_time = strftime(outstring, sizeof(outstring), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", temp);
       protected_write_to_file(outstring, length_of_time);
    } 
 }
